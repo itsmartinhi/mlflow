@@ -24,7 +24,7 @@ import logging
 import os
 import tempfile
 from copy import deepcopy
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import yaml
 from packaging.version import Version
@@ -490,28 +490,23 @@ class _LGBModelWrapper:
         return self.lgb_model.predict(dataframe)
 
 
-def _patch_metric_names(metric_dict):
+def _patch_metric_names(metric_dict, patched_metric_keys: Set[str]):
     # lightgbm provides some metrics with "@", e.g. "ndcg@3" that are not valid MLflow metric names
     patched_metrics = {
         metric_name.replace("@", "_at_"): value for metric_name, value in metric_dict.items()
     }
     changed_keys = set(patched_metrics.keys()) - set(metric_dict.keys())
-    if changed_keys:
-        _logger.info(
-            "Identified one or more metrics with names containing the invalid character `@`."
-            " These metric names have been sanitized by replacing `@` with `_at_`, as follows: %s",
-            ", ".join(changed_keys),
-        )
+    patched_metric_keys.update(changed_keys)
 
     return patched_metrics
 
 
-def _autolog_callback(env, metrics_logger, eval_results):
+def _autolog_callback(env, metrics_logger, eval_results, patched_metric_keys: Set[str]):
     res = {}
     for data_name, eval_name, value, _ in env.evaluation_result_list:
         key = data_name + "-" + eval_name
         res[key] = value
-    res = _patch_metric_names(res)
+    res = _patch_metric_names(res, patched_metric_keys=patched_metric_keys)
     metrics_logger.record_metrics(res, env.iteration)
     eval_results.append(res)
 
@@ -669,13 +664,16 @@ def autolog(
         original(self, *args, **kwargs)
 
     def train_impl(_log_models, _log_datasets, original, *args, **kwargs):
-        def record_eval_results(eval_results, metrics_logger):
+        def record_eval_results(eval_results, metrics_logger, patched_metric_keys: Set[str]):
             """
             Create a callback function that records evaluation results.
             """
             return picklable_exception_safe_function(
                 functools.partial(
-                    _autolog_callback, metrics_logger=metrics_logger, eval_results=eval_results
+                    _autolog_callback,
+                    metrics_logger=metrics_logger,
+                    eval_results=eval_results,
+                    patched_metric_keys=patched_metric_keys,
                 )
             )
 
@@ -754,6 +752,9 @@ def autolog(
 
         train_set = args[1] if len(args) > 1 else kwargs.get("train_set")
 
+        # Set to store metric keys that were patched to replace `@` with `_at_` during training.
+        patched_metric_keys: Set[str] = set()
+
         # Whether to automatically log the training dataset as a dataset artifact.
         if _log_datasets and train_set:
             try:
@@ -771,18 +772,23 @@ def autolog(
                     else:
                         for valid_set, valid_name in zip(valid_sets, valid_names):
                             _log_lightgbm_dataset(
-                                valid_set, source, "eval", autologging_client, name=valid_name
+                                valid_set,
+                                source,
+                                "eval",
+                                autologging_client,
+                                name=valid_name,
                             )
 
                 dataset_logging_operations = autologging_client.flush(synchronous=False)
                 dataset_logging_operations.await_completion()
             except Exception as e:
                 _logger.warning(
-                    "Failed to log dataset information to MLflow Tracking. Reason: %s", e
+                    "Failed to log dataset information to MLflow Tracking. Reason: %s",
+                    e,
                 )
 
         with batch_metrics_logger(run_id) as metrics_logger:
-            callback = record_eval_results(eval_results, metrics_logger)
+            callback = record_eval_results(eval_results, metrics_logger, patched_metric_keys)
             if num_pos_args >= callbacks_index + 1:
                 tmp_list = list(args)
                 tmp_list[callbacks_index] += [callback]
@@ -874,6 +880,14 @@ def autolog(
         param_logging_operations.await_completion()
         if early_stopping:
             early_stopping_logging_operations.await_completion()
+
+        if patched_metric_keys:
+            _logger.info(
+                "Identified one or more metrics with names containing the"
+                "invalid character `@` during training. These metric names have been sanitized"
+                "by replacing `@` with `_at_`, as follows: %s",
+                ", ".join(patched_metric_keys),
+            )
 
         return model
 

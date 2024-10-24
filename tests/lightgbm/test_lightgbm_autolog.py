@@ -749,7 +749,12 @@ def test_lgb_autolog_does_not_break_dataset_instantiation_with_data_none():
 
 def test_callback_func_is_pickable():
     cb = picklable_exception_safe_function(
-        functools.partial(_autolog_callback, BatchMetricsLogger(run_id="1234"), eval_results={})
+        functools.partial(
+            _autolog_callback,
+            BatchMetricsLogger(run_id="1234"),
+            eval_results={},
+            patched_metric_keys=set(),
+        )
     )
     pickle.dumps(cb)
 
